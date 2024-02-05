@@ -4,9 +4,15 @@ import logging
 from datetime import datetime, timedelta
 from pathlib import Path
 from time import sleep
+from dataclasses import dataclass
+from typing import Optional
+import tqdm
+import tqdm.contrib.telegram
+from functools import partial
 
 import zfs_helpers
 import util
+from telegram_log_handler import TelegramHandler
 
 _LOGGER = logging.getLogger(__name__)
 _LOG_FILE_PATH = Path(__file__).with_suffix(".log")
@@ -19,6 +25,12 @@ logging.basicConfig(format="[%(asctime)s] {%(module)s:%(lineno)d} %(levelname)s 
 
 
 _ALL_ZPOOLS = zfs_helpers.get_all_zpools()
+
+
+@dataclass
+class TelegramCredentials:
+    api_token: str
+    chat_id: str
 
 
 def read_last_execution_time():
@@ -56,24 +68,51 @@ def is_execution_necessary(execution_after):
     return True
 
 
-def _run_and_monitor_scrub(zpool_name: str):
-    zfs_helpers.run_scrub(zpool_name=zpool_name)
-    while True:
-        _status, _addval = zfs_helpers.get_scrub_status(zpool_name=zpool_name)
-        if _status != zfs_helpers.ScrubStatus.SCANNING:
-            break
-        sleep(2)
-        # TODO Telegram set tqdm
-    if _status == zfs_helpers.ScrubStatus.NO_ERRORS:
-        # TODO Telegram tqdm to 100%
-        _LOGGER.info(f"Scrub finished with no errors for zpool '{zpool_name}'")
-    elif _status == zfs_helpers.ScrubStatus.ERRORS:
-        _LOGGER.warning(f"Scrub finished with an error for zpool '{zpool_name}':\n\n{_addval}")
-    else:
-        raise RuntimeError("We shouldn't have ended-up here!")
+def _run_and_monitor_scrub(zpool_name: str, telegram_credentials: Optional[TelegramCredentials]):
+    zfs_helpers.run_scrub(zpool_name=zpool_name, timeout_seconds=5)
+    _tqdm_fn = tqdm.tqdm if telegram_credentials is None else \
+        partial(tqdm.contrib.telegram.tqdm, token=telegram_credentials.api_token, chat_id=telegram_credentials.chat_id)
+    with _tqdm_fn(total=100.0, desc="Scrubbing") as _pbar:
+        while True:
+            _status, _addval = zfs_helpers.get_scrub_status(zpool_name=zpool_name)
+            if _status != zfs_helpers.ScrubStatus.SCANNING:
+                break
+            _pbar.update(_addval - _pbar.n)
+            sleep(2)
+        if _status == zfs_helpers.ScrubStatus.NO_ERRORS:
+            _pbar.update(100 - _pbar.n)
+            _LOGGER.info(f"Scrub finished with no errors for zpool '{zpool_name}'\n\n{_addval}")
+        elif _status == zfs_helpers.ScrubStatus.ERRORS:
+            _LOGGER.warning(f"Scrub finished with an error for zpool '{zpool_name}':\n\n{_addval}")
+        else:
+            raise RuntimeError("We shouldn't have ended-up here!")
 
 
 if __name__ == '__main__':
+    _parser = argparse.ArgumentParser(description="Retrieve information about ZFS pools")
+    _parser.add_argument("-z", "--zpool", type=str, help=f"The ZFS pool to scrub (default: '{_ALL_ZPOOLS[0] if len(_ALL_ZPOOLS) else ''}')")
+    _parser.add_argument("-e", "--execution-after", type=str, choices=["week", "day", "month"], help="Optional. Specifies the allowed timeframe for script execution (week, day, or month).")
+    _parser.add_argument("-t", "--telegram-api-token", type=str, help="Telegram API token")
+    _parser.add_argument("-c", "--telegram-chat-id", type=str, help="Telegram chat ID")
+
+    _args = _parser.parse_args()
+    _zpool = _args.zpool
+    _execution_after = _args.execution_after
+    _telegram_api_token = _args.telegram_api_token
+    _telegram_chat_id = _args.telegram_chat_id
+
+    # Handle Telegram-specific args
+    if sum(x is not None for x in (_telegram_api_token, _telegram_chat_id)) not in (0, 2):
+        _LOGGER.error("Either none of Telegram API token and chat ID must be given, or both of them! Exiting now.")
+        exit(1)
+    if _telegram_api_token is None:
+        _telegram_credentials = None
+    else:
+        _telegram_credentials = TelegramCredentials(api_token=_telegram_api_token, chat_id=_telegram_chat_id)
+        _telegram_log_handler = TelegramHandler(token=_telegram_api_token, ids=[_telegram_chat_id])
+        _telegram_log_handler.setLevel(logging.INFO)
+        logging.getLogger().addHandler(_telegram_log_handler)
+
     _LOGGER.debug("===================================")
     if len(_ALL_ZPOOLS) == 0:
         _LOGGER.info("No zpools available on the system. Exiting now.")
@@ -82,17 +121,9 @@ if __name__ == '__main__':
         _LOGGER.error("This script must be launched with sudo permissions! Exiting now.")
         exit(1)
 
-    _parser = argparse.ArgumentParser(description="Retrieve information about ZFS pools")
-    _parser.add_argument("-z", "--zpool", type=str, help=f"The ZFS pool to scrub (default: '{_ALL_ZPOOLS[0]}')")
-    _parser.add_argument("-e", "--execution-after", type=str, choices=["week", "day", "month"], help="Optional. Specifies the allowed timeframe for script execution (week, day, or month).")
-
-    _args = _parser.parse_args()
-    _zpool = _args.zpool
-    _execution_after = _args.execution_after
-
     # Check the last execution time
     if _execution_after is not None and is_execution_necessary(_execution_after) is False:
-        print(f"The script was run within the last {_execution_after}. Execution not necessary right now, exiting.")
+        _LOGGER.debug(f"The script was run within the last {_execution_after}. Execution not necessary right now, exiting.")
         exit(0)
 
     if _zpool is None:
@@ -100,5 +131,5 @@ if __name__ == '__main__':
     if _zpool not in _ALL_ZPOOLS:
         _LOGGER.error(f"Zpool '{_zpool}' does not exist on the system! Exiting now.")
 
-    _run_and_monitor_scrub(zpool_name=_zpool)
+    _run_and_monitor_scrub(zpool_name=_zpool, telegram_credentials=_telegram_credentials)
     write_last_execution_time()

@@ -2,7 +2,7 @@ import logging
 import subprocess
 import re
 from enum import Enum
-from time import sleep
+from time import sleep, time
 
 import util
 
@@ -48,12 +48,12 @@ def get_scrub_status(zpool_name: str) -> tuple[ScrubStatus, float|str]:
         raise RuntimeError(_err)
     _err_str = _match.group(1)
     if _err_str.lower().startswith("no "):
-        return ScrubStatus.NO_ERRORS, _err_str
+        return ScrubStatus.NO_ERRORS, _result.stdout
     else:
         return ScrubStatus.ERRORS, _result.stdout
 
 
-def run_scrub(zpool_name: str) -> None:
+def run_scrub(zpool_name: str, timeout_seconds: float) -> None:
     if util.IS_DEBUGGER is True:
         _LOGGER.info(f"Waiting for user to run 'zpool scrub {zpool_name}' manually..")
     else:
@@ -62,5 +62,13 @@ def run_scrub(zpool_name: str) -> None:
             _err = f"Error while running scrub on zpool '{zpool_name}'"
             _LOGGER.error(_err)
             raise RuntimeError(_err)
-    while get_scrub_status(zpool_name)[0] != ScrubStatus.SCANNING:
+    _started_at = time()
+    while True:
         sleep(0.5)
+        _status, _addval = get_scrub_status(zpool_name)
+        if _status == ScrubStatus.SCANNING:
+            break
+        elif (time() - _started_at) > timeout_seconds:
+            _err = f"Timeout while starting scrub on zpool '{zpool_name}: \n{_addval}'"
+            _LOGGER.error(_err)
+            raise RuntimeError(_err)

@@ -290,3 +290,5 @@ pyrightconfig.json
 
 last-execution.txt
 .idea/
+telegram-bot-crendentials.txt
+*.log.*
