@@ -22,6 +22,7 @@ DEFAULT_FORMATTER = logging.Formatter("<code>%(asctime)s UTC</code>\n"
                                       "<b>%(levelname)s</b>\n"
                                       "<pre>%(message)s</pre>")
 
+
 class TelegramHandler(logging.Handler):
     """
     A handler class which asynchronously sends a Telegram message for each logging event.

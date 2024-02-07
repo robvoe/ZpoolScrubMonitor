@@ -1,11 +1,14 @@
 import argparse
 import logging.handlers
 import logging
+import os
 from datetime import datetime, timedelta
 from pathlib import Path
 from time import sleep
 from dataclasses import dataclass
 from typing import Optional
+
+import psutil
 import tqdm
 import tqdm.contrib.telegram
 from functools import partial
@@ -22,6 +25,9 @@ logging.basicConfig(format="[%(asctime)s] {%(module)s:%(lineno)d} %(levelname)s 
                     level=logging.DEBUG,
                     handlers=[logging.StreamHandler(),
                               logging.handlers.TimedRotatingFileHandler(_LOG_FILE_PATH, when="midnight", backupCount=3)])
+
+logging.getLogger("requests").setLevel(logging.WARNING)
+logging.getLogger("urllib3").setLevel(logging.WARNING)
 
 
 _ALL_ZPOOLS = zfs_helpers.get_all_zpools()
@@ -61,6 +67,8 @@ def is_execution_necessary(execution_after):
     _time_since_last_execution = datetime.now() - last_execution_time
     if execution_after == "week" and _time_since_last_execution < timedelta(weeks=1):
         return False
+    elif execution_after == "2weeks" and _time_since_last_execution < timedelta(weeks=2):
+        return False
     elif execution_after == "day" and _time_since_last_execution < timedelta(days=1):
         return False
     elif execution_after == "month" and _time_since_last_execution < timedelta(days=30):
@@ -69,29 +77,44 @@ def is_execution_necessary(execution_after):
 
 
 def _run_and_monitor_scrub(zpool_name: str, telegram_credentials: Optional[TelegramCredentials]):
-    zfs_helpers.run_scrub(zpool_name=zpool_name, timeout_seconds=5)
+    zfs_helpers.start_scrub(zpool_name=zpool_name, timeout_seconds=5)
     _tqdm_fn = tqdm.tqdm if telegram_credentials is None else \
         partial(tqdm.contrib.telegram.tqdm, token=telegram_credentials.api_token, chat_id=telegram_credentials.chat_id)
-    with _tqdm_fn(total=100.0, desc="Scrubbing") as _pbar:
-        while True:
-            _status, _addval = zfs_helpers.get_scrub_status(zpool_name=zpool_name)
-            if _status != zfs_helpers.ScrubStatus.SCANNING:
-                break
-            _pbar.update(_addval - _pbar.n)
-            sleep(2)
-        if _status == zfs_helpers.ScrubStatus.NO_ERRORS:
-            _pbar.update(100 - _pbar.n)
-            _LOGGER.info(f"Scrub finished with no errors for zpool '{zpool_name}'\n\n{_addval}")
-        elif _status == zfs_helpers.ScrubStatus.ERRORS:
-            _LOGGER.warning(f"Scrub finished with an error for zpool '{zpool_name}':\n\n{_addval}")
-        else:
-            raise RuntimeError("We shouldn't have ended-up here!")
+    try:
+        with _tqdm_fn(total=100.0, desc="Scrubbing") as _pbar:
+            while True:
+                _status, _addval = zfs_helpers.get_scrub_status(zpool_name=zpool_name)
+                if _status != zfs_helpers.ScrubStatus.SCANNING:
+                    break
+                _pbar.update(_addval - _pbar.n)
+                sleep(2)
+            if _status == zfs_helpers.ScrubStatus.NO_ERRORS:
+                _pbar.update(100 - _pbar.n)
+                _LOGGER.info(f"Scrub finished with no errors for zpool '{zpool_name}'\n\n{_addval}")
+            elif _status == zfs_helpers.ScrubStatus.ERRORS:
+                _LOGGER.warning(f"Scrub finished with an error for zpool '{zpool_name}':\n\n{_addval}")
+            else:
+                raise RuntimeError("We shouldn't have ended-up here!")
+    except (SystemExit, KeyboardInterrupt) as e:
+        _LOGGER.warning(f"Script was interrupted by a {type(e).__name__}. The actual scrub of zpool '{zpool_name}', however, continues.")
+        raise
+
+
+def _is_already_running() -> bool:
+    _script_name = Path(__file__).name
+    for _process in psutil.process_iter(["pid", "name", "cmdline"]):
+        try:
+            if _process.pid != os.getpid() and _script_name in _process.cmdline():
+                return True
+        except psutil.Error:
+            pass
+    return False
 
 
 if __name__ == '__main__':
     _parser = argparse.ArgumentParser(description="Retrieve information about ZFS pools")
     _parser.add_argument("-z", "--zpool", type=str, help=f"The ZFS pool to scrub (default: '{_ALL_ZPOOLS[0] if len(_ALL_ZPOOLS) else ''}')")
-    _parser.add_argument("-e", "--execution-after", type=str, choices=["week", "day", "month"], help="Optional. Specifies the allowed timeframe for script execution (week, day, or month).")
+    _parser.add_argument("-e", "--execution-after", type=str, choices=["day", "week", "2weeks", "month"], help="Optional. Specifies the allowed timeframe for script execution (week, day, or month).")
     _parser.add_argument("-t", "--telegram-api-token", type=str, help="Telegram API token")
     _parser.add_argument("-c", "--telegram-chat-id", type=str, help="Telegram chat ID")
 
@@ -101,19 +124,25 @@ if __name__ == '__main__':
     _telegram_api_token = _args.telegram_api_token
     _telegram_chat_id = _args.telegram_chat_id
 
+    _LOGGER.debug("===================================")
+
     # Handle Telegram-specific args
     if sum(x is not None for x in (_telegram_api_token, _telegram_chat_id)) not in (0, 2):
         _LOGGER.error("Either none of Telegram API token and chat ID must be given, or both of them! Exiting now.")
         exit(1)
     if _telegram_api_token is None:
         _telegram_credentials = None
+        _LOGGER.debug("Running without Telegram")
     else:
         _telegram_credentials = TelegramCredentials(api_token=_telegram_api_token, chat_id=_telegram_chat_id)
         _telegram_log_handler = TelegramHandler(token=_telegram_api_token, ids=[_telegram_chat_id])
         _telegram_log_handler.setLevel(logging.INFO)
         logging.getLogger().addHandler(_telegram_log_handler)
+        _LOGGER.debug("Running with Telegram")
 
-    _LOGGER.debug("===================================")
+    if _is_already_running():
+        _LOGGER.debug("Another instance of myself is already active. Exiting now.")
+        exit(0)
     if len(_ALL_ZPOOLS) == 0:
         _LOGGER.info("No zpools available on the system. Exiting now.")
         exit(0)

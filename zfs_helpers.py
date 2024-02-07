@@ -35,7 +35,7 @@ def get_scrub_status(zpool_name: str) -> tuple[ScrubStatus, float|str]:
         raise RuntimeError(_err)
     _matches = re.findall(r"(\d{1,2}\.\d{1,2})%", _result.stdout)
     if len(_matches) > 1:
-        _err = f"Unexpected output format of scrub status of zpool '{zpool_name}': \n{_result.stdout}"
+        _err = f"Unexpected output format of scrub status of zpool '{zpool_name}': \n\n{_result.stdout}"
         _LOGGER.error(_err)
         raise RuntimeError(_err)
     if len(_matches) == 1:
@@ -43,7 +43,7 @@ def get_scrub_status(zpool_name: str) -> tuple[ScrubStatus, float|str]:
         return ScrubStatus.SCANNING, _percent
     _match = re.search(r"^errors:\s*(.*)\s*$", _result.stdout, flags=re.IGNORECASE | re.MULTILINE)
     if _match is None:
-        _err = f"Unexpected output format of scrub status of zpool '{zpool_name}': \n{_result.stdout}"
+        _err = f"Unexpected output format of scrub status of zpool '{zpool_name}': \n\n{_result.stdout}"
         _LOGGER.error(_err)
         raise RuntimeError(_err)
     _err_str = _match.group(1)
@@ -53,7 +53,14 @@ def get_scrub_status(zpool_name: str) -> tuple[ScrubStatus, float|str]:
         return ScrubStatus.ERRORS, _result.stdout
 
 
-def run_scrub(zpool_name: str, timeout_seconds: float) -> None:
+def start_scrub(zpool_name: str, timeout_seconds: float) -> None:
+    # First check if it already runs
+    _status, _addval = get_scrub_status(zpool_name)
+    if _status == ScrubStatus.SCANNING:
+        _LOGGER.debug("Scrub already runs, no need to restart it.")
+        return
+    # Now start the scrub
+    _LOGGER.debug("Scrub does not run currently, starting it now..")
     if util.IS_DEBUGGER is True:
         _LOGGER.info(f"Waiting for user to run 'zpool scrub {zpool_name}' manually..")
     else:
@@ -63,12 +70,13 @@ def run_scrub(zpool_name: str, timeout_seconds: float) -> None:
             _LOGGER.error(_err)
             raise RuntimeError(_err)
     _started_at = time()
+    # Now wait until the scrub actually starts
     while True:
         sleep(0.5)
         _status, _addval = get_scrub_status(zpool_name)
         if _status == ScrubStatus.SCANNING:
             break
         elif (time() - _started_at) > timeout_seconds:
-            _err = f"Timeout while starting scrub on zpool '{zpool_name}: \n{_addval}'"
+            _err = f"Timeout while starting scrub on zpool '{zpool_name}': \n\n{_addval}"
             _LOGGER.error(_err)
             raise RuntimeError(_err)
